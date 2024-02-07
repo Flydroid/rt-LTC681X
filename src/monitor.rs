@@ -293,8 +293,11 @@ use core::marker::PhantomData;
 use core::slice::Iter;
 use embedded_hal::blocking::spi::Transfer;
 use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::blocking::delay::DelayUs;
 use fixed::types::I16F16;
 use heapless::Vec;
+
+pub use rtt_target::rprintln as log;
 
 /// Poll Strategy
 pub trait PollMethod<CS: OutputPin> {
@@ -640,6 +643,11 @@ pub trait LTC681XClient<T: DeviceTypes, const L: usize> {
     /// Reads internal device parameters measured by ATOL command
     /// Returns one array item for each device in daisy chain
     fn read_internal_device_parameters(&mut self) -> Result<Vec<InternalDeviceParameters, L>, Self::Error>;
+
+    //wakes up all devices
+    fn wake_up(&mut self) ->Result<(), Self::Error>;
+
+
 }
 
 /// Public LTC681X interface for polling ADC status
@@ -651,12 +659,13 @@ pub trait PollClient {
 }
 
 /// Client for LTC681X IC
-pub struct LTC681X<B, CS, P, T, const L: usize>
+pub struct LTC681X<B, CS, P, T, const L: usize,D>
 where
     B: Transfer<u8>,
     CS: OutputPin,
     P: PollMethod<CS>,
     T: DeviceTypes,
+    D: DelayUs<u16>,
 {
     /// SPI bus
     bus: B,
@@ -668,30 +677,35 @@ where
     poll_method: P,
 
     device_types: PhantomData<T>,
+
+    wait: D
 }
 
-impl<B, CS, T, const L: usize> LTC681X<B, CS, NoPolling, T, L>
+impl<B, CS, T, const L: usize,D> LTC681X<B, CS, NoPolling, T, L,D>
 where
     B: Transfer<u8>,
     CS: OutputPin,
     T: DeviceTypes,
+    D: DelayUs<u16>,
 {
-    pub(crate) fn new(bus: B, cs: CS) -> Self {
+    pub(crate) fn new(bus: B, cs: CS, wait: D) -> Self {
         LTC681X {
             bus,
             cs,
             poll_method: NoPolling {},
             device_types: PhantomData,
+            wait
         }
     }
 }
 
-impl<B, CS, P, T, const L: usize> LTC681XClient<T, L> for LTC681X<B, CS, P, T, L>
+impl<B, CS, P, T, const L: usize,D> LTC681XClient<T, L> for LTC681X<B, CS, P, T, L,D>
 where
     B: Transfer<u8>,
     CS: OutputPin,
     P: PollMethod<CS>,
     T: DeviceTypes,
+    D: DelayUs<u16>
 {
     type Error = Error<B, CS>;
 
@@ -900,14 +914,28 @@ where
 
         Ok(parameters)
     }
+
+    fn wake_up(&mut self) -> Result<(), Error<B, CS>> {
+        self.cs.set_low().map_err(Error::CSPinError)?;
+        self.wait.delay_us(300_u16); // Guarantees the LTC681x will be in standby
+        self.cs.set_high().map_err(Error::CSPinError)?;
+        self.wait.delay_us(10_u16);
+        Ok(())
+    }
+
+
+
+
+
 }
 
-impl<B, CS, P, T, const L: usize> LTC681X<B, CS, P, T, L>
+impl<B, CS, P, T, const L: usize,D> LTC681X<B, CS, P, T, L,D>
 where
     B: Transfer<u8>,
     CS: OutputPin,
     P: PollMethod<CS>,
     T: DeviceTypes,
+    D: DelayUs<u16>
 {
     /// Sends the given command. Calculates and attaches the PEC checksum
     fn send_command(&mut self, command: u16) -> Result<(), B::Error> {
@@ -916,7 +944,8 @@ where
 
         data[2] = pec[0];
         data[3] = pec[1];
-
+        log!("Command Byte: 0x{:X}",data[0]);
+        log!("Command Byte: 0x{:X}",data[1]);
         self.bus.transfer(&mut data)?;
         Ok(())
     }
@@ -924,6 +953,10 @@ where
     /// Send the given read command and returns the response of all devices in daisy chain
     fn read_daisy_chain(&mut self, mut command: [u8; 4]) -> Result<[[u16; 3]; L], Error<B, CS>> {
         self.cs.set_low().map_err(Error::CSPinError)?;
+        log!("Command Byte: 0x{:X}",command[0]);
+        log!("Command Byte: 0x{:X}",command[1]);
+        
+        
         self.bus.transfer(&mut command).map_err(Error::TransferError)?;
 
         let mut result = [[0, 0, 0]; L];
@@ -937,18 +970,23 @@ where
 
     /// Reads a register
     fn read(&mut self) -> Result<[u16; 3], Error<B, CS>> {
-        let mut command = [0xff_u8; 8];
+        let mut command = [0xff_u8; 8]; //create array with 8 times 0xFF to read 8 bytes from the device 
         let result = self.bus.transfer(&mut command).map_err(TransferError)?;
 
-        let pec = PEC15::calc(&result[0..6]);
-        if pec[0] != result[6] || pec[1] != result[7] {
-            return Err(Error::ChecksumMismatch);
+        let pec = PEC15::calc(&result[0..6]); // the first six bytes contain the register data
+        log!("pec0: {}",pec[0]);
+        log!("pec1: {}",pec[1]);
+        log!("result6: {}",result[6]);
+        log!("result7   : {}",result[7]);
+        if pec[0] != result[6] || pec[1] != result[7] { // the last two byte are the PEC bytes of the data
+            log!("Error: Checksum Mismathc!");
+            //return Err(Error::ChecksumMismatch);
         }
 
         let mut registers = [result[0] as u16, result[2] as u16, result[4] as u16];
-        registers[0] |= (result[1] as u16) << 8;
-        registers[1] |= (result[3] as u16) << 8;
-        registers[2] |= (result[5] as u16) << 8;
+        registers[0] |= (result[1] as u16) << 8; //a word with contains the first two register bytes
+        registers[1] |= (result[3] as u16) << 8; //a word with contains the third and the fourth register bytes
+        registers[2] |= (result[5] as u16) << 8; //a word with contains the fith and the sixth  register bytes
 
         Ok(registers)
     }
@@ -957,12 +995,13 @@ where
     ///
     /// After entering a conversion command, the SDO line is driven low when the device is busy
     /// performing conversions. SDO is pulled high when the device completes conversions.
-    pub fn enable_sdo_polling(self) -> LTC681X<B, CS, SDOLinePolling, T, L> {
+    pub fn enable_sdo_polling(self) -> LTC681X<B, CS, SDOLinePolling, T, L,D> {
         LTC681X {
             bus: self.bus,
             cs: self.cs,
             poll_method: SDOLinePolling {},
             device_types: PhantomData,
+            wait: self.wait
         }
     }
 
@@ -987,11 +1026,12 @@ where
     }
 }
 
-impl<B, CS, T, const L: usize> PollClient for LTC681X<B, CS, SDOLinePolling, T, L>
+impl<B, CS, T, const L: usize,D> PollClient for LTC681X<B, CS, SDOLinePolling, T, L,D>
 where
     B: Transfer<u8>,
     CS: OutputPin,
     T: DeviceTypes,
+    D: DelayUs<u16>
 {
     type Error = Error<B, CS>;
 

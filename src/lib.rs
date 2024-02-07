@@ -44,6 +44,9 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(feature = "strict", deny(warnings))]
 
+#[cfg(test)]
+extern crate alloc;
+
 
 pub mod config;
 #[cfg(feature = "example")]
