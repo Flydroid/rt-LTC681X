@@ -323,6 +323,15 @@ impl<CS: OutputPin> PollMethod<CS> for NoPolling {
     }
 }
 
+/// Sends the PLACD command and then waits until 0xFF is returned
+pub struct PLADCPolling {}
+
+impl<CS: OutputPin> PollMethod<CS> for PLADCPolling {
+    fn end_command(&self, _cs: &mut CS) -> Result<(), CS::Error> {
+        Ok(())
+    }
+}
+
 /// ADC frequency and filtering settings
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum ADCMode {
@@ -1005,6 +1014,21 @@ where
         }
     }
 
+    /// Enables PLADC polling
+    ///
+    /// After entering a conversion command, the PLADC command is sent
+    /// While the ADC performs the conversion 0xff is sent until the ADC return 0xff to
+    /// indicated that the conversion is completed
+    pub fn enable_pladc_polling(self) -> LTC681X<B, CS, PLADCPolling, T, L,D> {
+        LTC681X {
+            bus: self.bus,
+            cs: self.cs,
+            poll_method: PLADCPolling {},
+            device_types: PhantomData,
+            wait: self.wait
+        }
+    }
+
     /// Calculates the temperature in °C based on raw register value
     fn calc_temperature(&self, value: u16) -> I16F16 {
         if value >= 53744 {
@@ -1049,6 +1073,43 @@ where
         Ok(false)
     }
 }
+
+
+impl<B, CS, T, const L: usize,D> PollClient for LTC681X<B, CS, PLADCPolling, T, L,D>
+where
+    B: Transfer<u8>,
+    CS: OutputPin,
+    T: DeviceTypes,
+    D: DelayUs<u16>
+{
+    type Error = Error<B, CS>;
+
+    /// Returns false if the ADC is busy
+    /// If ADC is ready, CS line is pulled high
+    fn adc_ready(&mut self) -> Result<bool, Self::Error> {
+        let command: [u8; 2] = [0x07,0x14]; // PLADC command
+        // convert byte array to u16 to send command
+        let command_u16 = u16::from_be_bytes([command[0], command[1]]);
+        log!("PLADC CMD: 0x{:x}",command_u16);
+        self.send_command(command_u16).map_err(Error::TransferError)?;
+
+        let mut result: &[u8] = &[0];
+        let mut poll_cmd: [u8;1] = [0xff];
+        let mut counter = 0;
+        while result[0] != 0xff && counter < 1000 {  
+            result = self.bus.transfer(&mut poll_cmd).map_err(Error::TransferError)?;
+            counter+=1;
+        }
+
+        if result[0] == 0xff {
+            self.cs.set_high().map_err(Error::CSPinError)?;
+            return Ok(true);
+        }
+        log!("adc_ready counter: {}",counter);
+        Ok(false) //timeout happend
+    }
+}
+
 
 impl<B: Transfer<u8>, CS: OutputPin> Debug for Error<B, CS> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
